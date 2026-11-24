@@ -31,6 +31,7 @@ Tick **Show a landing page** in the app's Landing page box, then add a tagline, 
 Tick **Turn on the private test builds page** in the Test builds box, choose an APK, enter its version and what's new, and press Update. Testers open the tester link shown in the box, see every build (newest first) with its size and SHA-256, and download it.
 
 - Only people with the link (or logged-in editors) can see the page or download builds. A wrong or missing key gets a normal 404.
+- Optionally set a **Tester password**. Then `/app-slug/test/` shows a password screen instead of a 404, and the right password unlocks the builds for 30 days on that browser. The password is stored hashed; after 5 wrong tries a visitor waits 15 minutes. Changing the password or making a new link signs everyone out. Tick **Landing page link** to show "Beta testers: download the APK directly (outside Google Play)" on the landing page.
 - Tick **Make a new link** to cut off the old link.
 - APKs are stored with random names in `wp-content/uploads/app-policy-builds/`, which has an `.htaccess` that blocks direct access on Apache and LiteSpeed. On Nginx add `location ^~ /wp-content/uploads/app-policy-builds/ { deny all; }`.
 - Pages are sent with `noindex` and no-cache headers.
