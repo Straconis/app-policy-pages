@@ -156,6 +156,8 @@ class App_Policy_Pages {
 			'enabled' => ! empty( $test['enabled'] ),
 			'key'     => isset( $test['key'] ) ? (string) $test['key'] : '',
 			'notes'   => isset( $test['notes'] ) ? (string) $test['notes'] : '',
+			'password_hash' => isset( $test['password_hash'] ) ? (string) $test['password_hash'] : '',
+			'show_link'     => ! empty( $test['show_link'] ),
 		);
 		return $app;
 	}
@@ -208,27 +210,115 @@ class App_Policy_Pages {
 		return $dir;
 	}
 
-	public static function test_url( $app, $build_id = '' ) {
+	/**
+	 * How the current visitor got into the test builds: 'key', 'password',
+	 * 'editor', or '' when they haven't.
+	 *
+	 * @var string
+	 */
+	public static $test_access = '';
+
+	const PASSWORD_TRIES  = 5;
+	const PASSWORD_LOCK   = 900; // Seconds a visitor waits after too many wrong passwords.
+	const PASSWORD_COOKIE = 30;  // Days a correct password is remembered.
+
+	/**
+	 * URL of the test page or of one build's download. The key is added only
+	 * when the visitor came in with the key (or $with_key is forced on).
+	 */
+	public static function test_url( $app, $build_id = '', $with_key = null ) {
 		$path = self::prefix() . $app['slug'] . '/test/';
 		if ( $build_id ) {
 			$path .= 'download/' . $build_id . '/';
 		}
-		return add_query_arg( 'key', rawurlencode( $app['test']['key'] ), home_url( user_trailingslashit( $path ) ) );
+		$url = home_url( user_trailingslashit( $path ) );
+		if ( null === $with_key ) {
+			$with_key = 'password' !== self::$test_access;
+		}
+		return $with_key ? add_query_arg( 'key', rawurlencode( $app['test']['key'] ), $url ) : $url;
+	}
+
+	public static function has_password( $app ) {
+		return '' !== $app['test']['password_hash'];
+	}
+
+	private static function cookie_name( $app ) {
+		return 'app_policy_tester_' . (int) $app['id'];
 	}
 
 	/**
-	 * Testers get in with the key; people who can edit the app always can.
+	 * Cookie value proving the right password was entered. Changing the
+	 * password or making a new link logs everyone out.
+	 */
+	private static function cookie_value( $app ) {
+		return hash_hmac( 'sha256', $app['id'] . '|' . $app['test']['key'] . '|' . $app['test']['password_hash'], wp_salt( 'auth' ) );
+	}
+
+	/**
+	 * Testers get in with the key link or the tester password; people who
+	 * can edit the app always can.
 	 */
 	public static function can_see_tests( $app ) {
+		self::$test_access = '';
 		if ( ! $app['test']['enabled'] ) {
 			return false;
 		}
-		if ( current_user_can( 'edit_post', $app['id'] ) ) {
-			return true;
-		}
 		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- the key is the access check.
 		$given = isset( $_GET['key'] ) ? sanitize_text_field( wp_unslash( $_GET['key'] ) ) : '';
-		return '' !== $app['test']['key'] && '' !== $given && hash_equals( $app['test']['key'], $given );
+		if ( '' !== $app['test']['key'] && '' !== $given && hash_equals( $app['test']['key'], $given ) ) {
+			self::$test_access = 'key';
+			return true;
+		}
+		$name = self::cookie_name( $app );
+		if ( self::has_password( $app ) && isset( $_COOKIE[ $name ] ) && hash_equals( self::cookie_value( $app ), sanitize_text_field( wp_unslash( $_COOKIE[ $name ] ) ) ) ) {
+			self::$test_access = 'password';
+			return true;
+		}
+		if ( current_user_can( 'edit_post', $app['id'] ) ) {
+			self::$test_access = 'editor';
+			return true;
+		}
+		return false;
+	}
+
+	private static function throttle_key( $app ) {
+		$ip = isset( $_SERVER['REMOTE_ADDR'] ) ? sanitize_text_field( wp_unslash( $_SERVER['REMOTE_ADDR'] ) ) : '';
+		return 'app_policy_pw_' . md5( $app['id'] . '|' . $ip );
+	}
+
+	/**
+	 * Check a submitted tester password. Returns '' on success (and sets the
+	 * cookie), otherwise an error message.
+	 */
+	private static function try_password( $app ) {
+		$tkey  = self::throttle_key( $app );
+		$fails = (int) get_transient( $tkey );
+		if ( $fails >= self::PASSWORD_TRIES ) {
+			return __( 'Too many wrong passwords. Please wait 15 minutes and try again.', 'app-policy-pages' );
+		}
+		// phpcs:ignore WordPress.Security.NonceVerification.Missing -- public password form; the password is the check.
+		$given = isset( $_POST['app_policy_password'] ) ? (string) wp_unslash( $_POST['app_policy_password'] ) : '';
+		if ( '' !== $given && wp_check_password( $given, $app['test']['password_hash'] ) ) {
+			delete_transient( $tkey );
+			$expires = time() + self::PASSWORD_COOKIE * DAY_IN_SECONDS;
+			$path    = wp_parse_url( home_url( '/' ), PHP_URL_PATH );
+			setcookie(
+				self::cookie_name( $app ),
+				self::cookie_value( $app ),
+				array(
+					'expires'  => $expires,
+					'path'     => $path ? $path : '/',
+					'secure'   => is_ssl(),
+					'httponly' => true,
+					'samesite' => 'Lax',
+				)
+			);
+			return '';
+		}
+		set_transient( $tkey, $fails + 1, self::PASSWORD_LOCK );
+		return ( $fails + 1 >= self::PASSWORD_TRIES )
+			? __( 'Too many wrong passwords. Please wait 15 minutes and try again.', 'app-policy-pages' )
+			: __( 'That password isn\'t right. Please try again.', 'app-policy-pages' );
 	}
 
 	private static function no_cache_private() {
@@ -500,6 +590,10 @@ class App_Policy_Pages {
 		flush_rewrite_rules( false );
 	}
 
+	public static function tester_login_url( $app ) {
+		return self::test_url( $app, '', false );
+	}
+
 	public function template_redirect() {
 		$slug = get_query_var( self::QV_APP );
 		if ( '' === $slug || null === $slug ) {
@@ -509,9 +603,25 @@ class App_Policy_Pages {
 		$doc_key = (string) get_query_var( self::QV_DOC );
 		$types   = self::document_types();
 
-		$is_test = 'test' === $doc_key;
+		$is_test     = 'test' === $doc_key;
+		$show_login  = false;
+		$login_error = '';
 		if ( $app && $is_test && ! self::can_see_tests( $app ) ) {
-			$app = null; // A wrong key looks the same as no page at all.
+			$build_id = (string) get_query_var( self::QV_BUILD );
+			if ( $app['test']['enabled'] && self::has_password( $app ) && '' === $build_id ) {
+				// Tester password screen.
+				// phpcs:ignore WordPress.Security.NonceVerification.Missing -- public password form.
+				if ( isset( $_SERVER['REQUEST_METHOD'] ) && 'POST' === $_SERVER['REQUEST_METHOD'] && isset( $_POST['app_policy_password'] ) ) {
+					$login_error = self::try_password( $app );
+					if ( '' === $login_error ) {
+						wp_safe_redirect( self::test_url( $app, '', false ), 303 );
+						exit;
+					}
+				}
+				$show_login = true;
+			} else {
+				$app = null; // A wrong key looks the same as no page at all.
+			}
 		}
 		if ( ! $app || ( '' !== $doc_key && ! $is_test && ( ! isset( $types[ $doc_key ] ) || ! $app['docs'][ $doc_key ]['enabled'] ) ) ) {
 			global $wp_query;
@@ -524,7 +634,10 @@ class App_Policy_Pages {
 		}
 
 		$settings = self::settings();
-		if ( $is_test ) {
+		if ( $show_login ) {
+			self::no_cache_private();
+			$template = APP_POLICY_PAGES_DIR . 'templates/test-login.php';
+		} elseif ( $is_test ) {
 			$build_id = sanitize_key( (string) get_query_var( self::QV_BUILD ) );
 			if ( $build_id ) {
 				self::serve_build( $app, $build_id );

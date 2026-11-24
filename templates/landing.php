@@ -50,6 +50,7 @@ $canonical   = App_Policy_Pages::app_url( $app );
 .tagline{margin:.2rem 0 0;font-size:1.1rem}
 .by{color:var(--muted);margin:.2rem 0 0;font-size:.95rem}
 .cta{margin:1.5rem 0}
+.tester{margin-top:2.5rem;font-size:.95rem}
 .shots{display:flex;gap:12px;overflow-x:auto;padding:4px 0 12px;margin:1.5rem 0;scroll-snap-type:x mandatory}
 .shots img{height:420px;width:auto;max-width:none;border-radius:14px;flex:none;scroll-snap-align:start;border:1px solid var(--rule)}
 @media (max-width:480px){.hero{gap:14px}.hero img{width:72px;height:72px;border-radius:16px}.shots img{height:360px}}
@@ -83,6 +84,10 @@ $canonical   = App_Policy_Pages::app_url( $app );
 <?php endif; ?>
 
 <?php echo $description; // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- kses-filtered, placeholders escaped. ?>
+
+<?php if ( $app['test']['enabled'] && $app['test']['show_link'] && App_Policy_Pages::has_password( $app ) ) : ?>
+	<p class="tester"><a href="<?php echo esc_url( App_Policy_Pages::tester_login_url( $app ) ); ?>" rel="nofollow"><?php esc_html_e( 'Beta testers: download the APK directly (outside Google Play)', 'app-policy-pages' ); ?></a></p>
+<?php endif; ?>
 
 <footer><?php echo App_Policy_Pages::footer_links( $app ); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- built from escaped parts. ?></footer>
 </main>

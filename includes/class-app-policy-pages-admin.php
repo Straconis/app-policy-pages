@@ -262,10 +262,19 @@ class App_Policy_Pages_Admin {
 		if ( '' === $key || ! empty( $t['new_key'] ) ) {
 			$key = self::new_key();
 		}
+		$hash = is_array( $existing ) && ! empty( $existing['test']['password_hash'] ) ? (string) $existing['test']['password_hash'] : '';
+		$new  = isset( $t['new_password'] ) ? trim( (string) $t['new_password'] ) : '';
+		if ( '' !== $new ) {
+			$hash = wp_hash_password( $new );
+		} elseif ( ! empty( $t['clear_password'] ) ) {
+			$hash = '';
+		}
 		$out['test'] = array(
-			'enabled' => ! empty( $t['enabled'] ),
-			'key'     => $key,
-			'notes'   => wp_kses_post( isset( $t['notes'] ) ? (string) $t['notes'] : '' ),
+			'enabled'       => ! empty( $t['enabled'] ),
+			'key'           => $key,
+			'notes'         => wp_kses_post( isset( $t['notes'] ) ? (string) $t['notes'] : '' ),
+			'password_hash' => $hash,
+			'show_link'     => ! empty( $t['show_link'] ),
 		);
 		return $out;
 	}
@@ -499,6 +508,23 @@ class App_Policy_Pages_Admin {
 		<?php else : ?>
 			<p class="description"><?php esc_html_e( 'Publish the app to get its tester link.', 'app-policy-pages' ); ?></p>
 		<?php endif; ?>
+		<table class="form-table app-policy-form" role="presentation">
+			<tr><th><label for="apppol-test-password"><?php esc_html_e( 'Tester password', 'app-policy-pages' ); ?></label></th>
+				<td>
+					<input type="password" id="apppol-test-password" name="app_policy[test][new_password]" class="regular-text" autocomplete="new-password" placeholder="<?php echo esc_attr( App_Policy_Pages::has_password( $app ) ? __( 'Set. Type to change', 'app-policy-pages' ) : __( 'Not set', 'app-policy-pages' ) ); ?>">
+					<?php if ( App_Policy_Pages::has_password( $app ) ) : ?>
+						<label style="margin-left:1em"><input type="checkbox" name="app_policy[test][clear_password]" value="1"> <?php esc_html_e( 'Remove the password', 'app-policy-pages' ); ?></label>
+					<?php endif; ?>
+					<p class="description">
+					<?php
+					/* translators: 1: number of tries, 2: tester page URL. */
+					printf( esc_html__( 'Optional. With a password, testers can also get in at %2$s by typing it, instead of using the secret link. It is stored hashed, and after %1$d wrong tries a visitor has to wait 15 minutes. Changing it signs everyone out.', 'app-policy-pages' ), (int) App_Policy_Pages::PASSWORD_TRIES, '<code>' . esc_html( App_Policy_Pages::tester_login_url( $app ) ) . '</code>' );
+					?>
+					</p>
+				</td></tr>
+			<tr><th><?php esc_html_e( 'Landing page link', 'app-policy-pages' ); ?></th>
+				<td><label><input type="checkbox" name="app_policy[test][show_link]" value="1" <?php checked( $app['test']['show_link'] ); ?>> <?php esc_html_e( 'Show a "Beta testers: download the APK directly (outside Google Play)" link on the landing page (only when a password is set)', 'app-policy-pages' ); ?></label></td></tr>
+		</table>
 		<p><label for="apppol-test-notes"><strong><?php esc_html_e( 'Message for testers', 'app-policy-pages' ); ?></strong></label> <span class="description"><?php esc_html_e( '(shown above the builds, optional)', 'app-policy-pages' ); ?></span><br>
 			<textarea id="apppol-test-notes" name="app_policy[test][notes]" rows="3" class="large-text"><?php echo esc_textarea( $t['notes'] ); ?></textarea></p>
 
@@ -703,7 +729,7 @@ class App_Policy_Pages_Admin {
 		if ( ! $post || App_Policy_Pages::POST_TYPE !== $post->post_type || ! is_array( $raw ) ) {
 			wp_die( esc_html__( 'App not found.', 'app-policy-pages' ) );
 		}
-		unset( $raw['test']['key'] ); // Never put the private tester link in an export.
+		unset( $raw['test']['key'], $raw['test']['password_hash'] ); // Never put tester secrets in an export.
 		$export = array_merge(
 			array(
 				'format' => 'app-policy-pages/1',
