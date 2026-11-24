@@ -39,6 +39,8 @@ class App_Policy_Pages_Admin {
 		add_action( 'admin_post_app_policy_import', array( $this, 'import_app' ) );
 		add_action( 'admin_notices', array( $this, 'notices' ) );
 		add_action( 'admin_head', array( $this, 'admin_css' ) );
+		add_action( 'post_edit_form_tag', array( $this, 'form_enctype' ) );
+		add_action( 'admin_enqueue_scripts', array( $this, 'enqueue' ) );
 		add_filter( 'plugin_action_links_' . plugin_basename( APP_POLICY_PAGES_FILE ), array( $this, 'plugin_links' ) );
 	}
 
@@ -52,6 +54,8 @@ class App_Policy_Pages_Admin {
 
 	public function add_meta_boxes( $post ) {
 		add_meta_box( 'app-policy-details', __( 'App details', 'app-policy-pages' ), array( $this, 'box_details' ), null, 'normal', 'high' );
+		add_meta_box( 'app-policy-landing', __( 'Landing page', 'app-policy-pages' ), array( $this, 'box_landing' ), null, 'normal', 'high' );
+		add_meta_box( 'app-policy-tests', __( 'Test builds', 'app-policy-pages' ), array( $this, 'box_tests' ), null, 'normal', 'default' );
 		foreach ( App_Policy_Pages::document_types() as $key => $type ) {
 			add_meta_box(
 				'app-policy-doc-' . $key,
@@ -177,6 +181,8 @@ class App_Policy_Pages_Admin {
 			return;
 		}
 		echo '<ul class="app-policy-linklist">';
+		$home = App_Policy_Pages::app_url( $app );
+		echo '<li><strong>' . esc_html( $app['landing']['enabled'] ? __( 'Landing page', 'app-policy-pages' ) : __( 'Index of policies', 'app-policy-pages' ) ) . '</strong><br><a href="' . esc_url( $home ) . '" target="_blank" rel="noopener">' . esc_html( $home ) . '</a></li>';
 		foreach ( App_Policy_Pages::document_types() as $key => $type ) {
 			$url = App_Policy_Pages::app_url( $app, $key );
 			echo '<li><strong>' . esc_html( $type['label'] ) . '</strong>';
@@ -186,6 +192,10 @@ class App_Policy_Pages_Admin {
 				echo '<br><em>' . esc_html__( 'Not published', 'app-policy-pages' ) . '</em>';
 			}
 			echo '</li>';
+		}
+		if ( $app['test']['enabled'] && $app['test']['key'] ) {
+			$turl = App_Policy_Pages::test_url( $app );
+			echo '<li><strong>' . esc_html__( 'Test builds (private)', 'app-policy-pages' ) . '</strong><br><a href="' . esc_url( $turl ) . '" target="_blank" rel="noopener noreferrer">' . esc_html( $turl ) . '</a></li>';
 		}
 		echo '</ul>';
 		echo '<p class="description">' . esc_html__( 'To show a policy inside a normal page of your theme instead, use a shortcode:', 'app-policy-pages' ) . '</p>';
@@ -235,7 +245,33 @@ class App_Policy_Pages_Admin {
 				'content' => wp_kses_post( isset( $d['content'] ) ? (string) $d['content'] : '' ),
 			);
 		}
+		$l              = isset( $in['landing'] ) && is_array( $in['landing'] ) ? $in['landing'] : array();
+		$shots          = isset( $l['screenshot_ids'] ) ? $l['screenshot_ids'] : array();
+		$shots          = is_array( $shots ) ? $shots : explode( ',', (string) $shots );
+		$out['landing'] = array(
+			'enabled'        => ! empty( $l['enabled'] ),
+			'tagline'        => sanitize_text_field( isset( $l['tagline'] ) ? $l['tagline'] : '' ),
+			'description'    => wp_kses_post( isset( $l['description'] ) ? (string) $l['description'] : '' ),
+			'icon_id'        => isset( $l['icon_id'] ) ? absint( $l['icon_id'] ) : 0,
+			'screenshot_ids' => array_values( array_filter( array_map( 'absint', $shots ) ) ),
+		);
+
+		$t        = isset( $in['test'] ) && is_array( $in['test'] ) ? $in['test'] : array();
+		$existing = get_post_meta( $post_id, App_Policy_Pages::META_KEY, true );
+		$key      = is_array( $existing ) && ! empty( $existing['test']['key'] ) ? (string) $existing['test']['key'] : '';
+		if ( '' === $key || ! empty( $t['new_key'] ) ) {
+			$key = self::new_key();
+		}
+		$out['test'] = array(
+			'enabled' => ! empty( $t['enabled'] ),
+			'key'     => $key,
+			'notes'   => wp_kses_post( isset( $t['notes'] ) ? (string) $t['notes'] : '' ),
+		);
 		return $out;
+	}
+
+	private static function new_key() {
+		return strtolower( wp_generate_password( 24, false, false ) );
 	}
 
 	/**
@@ -288,11 +324,221 @@ class App_Policy_Pages_Admin {
 		$data = self::sanitize_app_data( $in, $post_id, $post->post_title );
 		update_post_meta( $post_id, App_Policy_Pages::META_KEY, $data );
 		App_Policy_Pages::rebuild_routes();
+		$this->save_builds( $post_id );
 
 		$page = get_page_by_path( App_Policy_Pages::prefix() . $data['slug'] );
 		if ( $page ) {
 			set_transient( 'app_policy_conflict_' . get_current_user_id(), $data['slug'], 60 );
 		}
+	}
+
+	/**
+	 * Delete ticked builds and store a newly uploaded one.
+	 */
+	private function save_builds( $post_id ) {
+		$builds  = get_post_meta( $post_id, App_Policy_Pages::BUILDS_META, true );
+		$builds  = is_array( $builds ) ? $builds : array();
+		$changed = false;
+		$dir     = App_Policy_Pages::builds_dir( $post_id );
+
+		// phpcs:disable WordPress.Security.NonceVerification.Missing -- checked in save_app().
+		$delete = isset( $_POST['app_policy_delete_builds'] ) ? array_map( 'sanitize_key', (array) wp_unslash( $_POST['app_policy_delete_builds'] ) ) : array();
+		foreach ( $builds as $i => $build ) {
+			if ( in_array( $build['id'], $delete, true ) ) {
+				wp_delete_file( $dir . '/' . basename( $build['file'] ) );
+				unset( $builds[ $i ] );
+				$changed = true;
+			}
+		}
+
+		$upload = isset( $_FILES['app_policy_build_file'] ) ? $_FILES['app_policy_build_file'] : null; // phpcs:ignore WordPress.Security.ValidatedSanitizedInput -- validated below.
+		if ( $upload && isset( $upload['error'] ) && UPLOAD_ERR_NO_FILE !== (int) $upload['error'] ) {
+			$version = isset( $_POST['app_policy_build_version'] ) ? sanitize_text_field( wp_unslash( $_POST['app_policy_build_version'] ) ) : '';
+			$notes   = isset( $_POST['app_policy_build_notes'] ) ? sanitize_textarea_field( wp_unslash( $_POST['app_policy_build_notes'] ) ) : '';
+			$error   = '';
+			$name    = isset( $upload['name'] ) ? (string) $upload['name'] : '';
+			$tmp     = isset( $upload['tmp_name'] ) ? (string) $upload['tmp_name'] : '';
+			if ( UPLOAD_ERR_OK !== (int) $upload['error'] ) {
+				/* translators: %s: maximum upload size. */
+				$error = in_array( (int) $upload['error'], array( UPLOAD_ERR_INI_SIZE, UPLOAD_ERR_FORM_SIZE ), true ) ? sprintf( __( 'The APK is larger than this server allows (%s).', 'app-policy-pages' ), size_format( wp_max_upload_size() ) ) : __( 'The upload failed. Please try again.', 'app-policy-pages' );
+			} elseif ( '' === $version ) {
+				$error = __( 'Enter a version number for the build.', 'app-policy-pages' );
+			} elseif ( 'apk' !== strtolower( pathinfo( $name, PATHINFO_EXTENSION ) ) || ! is_uploaded_file( $tmp ) ) {
+				$error = __( 'Only .apk files can be uploaded as test builds.', 'app-policy-pages' );
+			} else {
+				$fh    = fopen( $tmp, 'rb' ); // phpcs:ignore WordPress.WP.AlternativeFunctions
+				$magic = $fh ? fread( $fh, 4 ) : ''; // phpcs:ignore WordPress.WP.AlternativeFunctions
+				if ( $fh ) {
+					fclose( $fh ); // phpcs:ignore WordPress.WP.AlternativeFunctions
+				}
+				if ( "PK\x03\x04" !== $magic ) {
+					$error = __( 'That file is not a valid APK.', 'app-policy-pages' );
+				}
+			}
+			if ( ! $error ) {
+				$id   = strtolower( wp_generate_password( 12, false, false ) );
+				$file = $id . '.apk';
+				if ( move_uploaded_file( $tmp, $dir . '/' . $file ) ) {
+					$builds[] = array(
+						'id'       => $id,
+						'file'     => $file,
+						'version'  => $version,
+						'notes'    => $notes,
+						'size'     => filesize( $dir . '/' . $file ),
+						'sha256'   => hash_file( 'sha256', $dir . '/' . $file ),
+						'original' => sanitize_file_name( $name ),
+						'uploaded' => time(),
+					);
+					$changed  = true;
+					/* translators: %s: version number. */
+					$this->notice( 'success', sprintf( __( 'Test build %s uploaded.', 'app-policy-pages' ), $version ) );
+				} else {
+					$error = __( 'Could not save the APK on the server.', 'app-policy-pages' );
+				}
+			}
+			if ( $error ) {
+				$this->notice( 'error', $error );
+			}
+		}
+		// phpcs:enable
+		if ( $changed ) {
+			update_post_meta( $post_id, App_Policy_Pages::BUILDS_META, array_values( $builds ) );
+		}
+	}
+
+	private function notice( $type, $message ) {
+		set_transient( 'app_policy_notice_' . get_current_user_id(), array( $type, $message ), 120 );
+	}
+
+	public function form_enctype( $post ) {
+		if ( App_Policy_Pages::POST_TYPE === $post->post_type ) {
+			echo ' enctype="multipart/form-data"';
+		}
+	}
+
+	public function enqueue( $hook ) {
+		$screen = get_current_screen();
+		if ( ! $screen || App_Policy_Pages::POST_TYPE !== $screen->post_type || ! in_array( $hook, array( 'post.php', 'post-new.php' ), true ) ) {
+			return;
+		}
+		wp_enqueue_media();
+		wp_enqueue_script( 'app-policy-pages-admin', plugins_url( 'assets/admin.js', APP_POLICY_PAGES_FILE ), array( 'jquery' ), APP_POLICY_PAGES_VERSION, true );
+		wp_localize_script(
+			'app-policy-pages-admin',
+			'appPolicyPages',
+			array(
+				'chooseIcon'  => __( 'Choose app icon', 'app-policy-pages' ),
+				'chooseShots' => __( 'Choose screenshots', 'app-policy-pages' ),
+				'use'         => __( 'Use these', 'app-policy-pages' ),
+				'copied'      => __( 'Copied', 'app-policy-pages' ),
+			)
+		);
+	}
+
+	public function box_landing( $post ) {
+		$app = $this->editor_data( $post );
+		$l   = $app['landing'];
+		?>
+		<p><label><input type="checkbox" name="app_policy[landing][enabled]" value="1" <?php checked( $l['enabled'] ); ?>> <?php esc_html_e( 'Show a landing page at the app\'s main URL (otherwise it shows a plain list of the policy pages)', 'app-policy-pages' ); ?></label></p>
+		<table class="form-table app-policy-form" role="presentation">
+			<tr>
+				<th><label for="apppol-tagline"><?php esc_html_e( 'Tagline', 'app-policy-pages' ); ?></label></th>
+				<td><input type="text" id="apppol-tagline" name="app_policy[landing][tagline]" value="<?php echo esc_attr( $l['tagline'] ); ?>" class="large-text" placeholder="<?php esc_attr_e( 'One short line about the app', 'app-policy-pages' ); ?>"></td>
+			</tr>
+			<tr>
+				<th><?php esc_html_e( 'App icon', 'app-policy-pages' ); ?></th>
+				<td class="app-policy-media" data-multiple="0">
+					<input type="hidden" name="app_policy[landing][icon_id]" value="<?php echo esc_attr( $l['icon_id'] ? $l['icon_id'] : '' ); ?>">
+					<div class="app-policy-previews"><?php echo $l['icon_id'] ? wp_get_attachment_image( $l['icon_id'], 'thumbnail' ) : ''; ?></div>
+					<button type="button" class="button app-policy-pick"><?php esc_html_e( 'Choose icon', 'app-policy-pages' ); ?></button>
+					<button type="button" class="button-link app-policy-clear"><?php esc_html_e( 'Remove', 'app-policy-pages' ); ?></button>
+				</td>
+			</tr>
+			<tr>
+				<th><?php esc_html_e( 'Screenshots', 'app-policy-pages' ); ?></th>
+				<td class="app-policy-media" data-multiple="1">
+					<input type="hidden" name="app_policy[landing][screenshot_ids]" value="<?php echo esc_attr( implode( ',', $l['screenshot_ids'] ) ); ?>">
+					<div class="app-policy-previews">
+					<?php
+					foreach ( $l['screenshot_ids'] as $sid ) {
+						echo wp_get_attachment_image( $sid, 'thumbnail' );
+					}
+					?>
+					</div>
+					<button type="button" class="button app-policy-pick"><?php esc_html_e( 'Choose screenshots', 'app-policy-pages' ); ?></button>
+					<button type="button" class="button-link app-policy-clear"><?php esc_html_e( 'Remove all', 'app-policy-pages' ); ?></button>
+					<p class="description"><?php esc_html_e( 'Select several at once. They show in the order you pick them.', 'app-policy-pages' ); ?></p>
+				</td>
+			</tr>
+		</table>
+		<p><strong><?php esc_html_e( 'Description', 'app-policy-pages' ); ?></strong> <span class="description"><?php esc_html_e( '(a few paragraphs or a feature list; placeholders work here too)', 'app-policy-pages' ); ?></span></p>
+		<?php
+		wp_editor(
+			$l['description'],
+			'apppol_landing_description',
+			array(
+				'textarea_name' => 'app_policy[landing][description]',
+				'textarea_rows' => 10,
+				'media_buttons' => true,
+			)
+		);
+		echo '<p class="description">' . esc_html__( 'The "Get it on Google Play" button uses the Store listing URL above.', 'app-policy-pages' ) . '</p>';
+	}
+
+	public function box_tests( $post ) {
+		$app    = App_Policy_Pages::get_app( $post );
+		$t      = $app['test'];
+		$builds = App_Policy_Pages::get_builds( $post->ID );
+		?>
+		<p><label><input type="checkbox" name="app_policy[test][enabled]" value="1" <?php checked( $t['enabled'] ); ?>> <?php esc_html_e( 'Turn on the private test builds page', 'app-policy-pages' ); ?></label></p>
+		<?php if ( $t['key'] && 'publish' === $post->post_status ) : ?>
+			<p><?php esc_html_e( 'Tester link (only people with this link can see and download builds):', 'app-policy-pages' ); ?><br>
+				<input type="text" readonly class="large-text code app-policy-copy" value="<?php echo esc_attr( App_Policy_Pages::test_url( $app ) ); ?>">
+			</p>
+			<p><label><input type="checkbox" name="app_policy[test][new_key]" value="1"> <?php esc_html_e( 'Make a new link when I save (the old link stops working)', 'app-policy-pages' ); ?></label></p>
+		<?php else : ?>
+			<p class="description"><?php esc_html_e( 'Publish the app to get its tester link.', 'app-policy-pages' ); ?></p>
+		<?php endif; ?>
+		<p><label for="apppol-test-notes"><strong><?php esc_html_e( 'Message for testers', 'app-policy-pages' ); ?></strong></label> <span class="description"><?php esc_html_e( '(shown above the builds, optional)', 'app-policy-pages' ); ?></span><br>
+			<textarea id="apppol-test-notes" name="app_policy[test][notes]" rows="3" class="large-text"><?php echo esc_textarea( $t['notes'] ); ?></textarea></p>
+
+		<h4><?php esc_html_e( 'Upload a build', 'app-policy-pages' ); ?></h4>
+		<table class="form-table app-policy-form" role="presentation">
+			<tr><th><label for="apppol-build-file"><?php esc_html_e( 'APK file', 'app-policy-pages' ); ?></label></th>
+				<td><input type="file" id="apppol-build-file" name="app_policy_build_file" accept=".apk,application/vnd.android.package-archive">
+				<p class="description">
+				<?php
+				/* translators: %s: size such as 64 MB. */
+				printf( esc_html__( 'Largest file this server accepts: %s. The file is uploaded when you press Update or Publish.', 'app-policy-pages' ), esc_html( size_format( wp_max_upload_size() ) ) );
+				?>
+				</p></td></tr>
+			<tr><th><label for="apppol-build-version"><?php esc_html_e( 'Version', 'app-policy-pages' ); ?></label></th>
+				<td><input type="text" id="apppol-build-version" name="app_policy_build_version" class="regular-text" placeholder="0.9.2"></td></tr>
+			<tr><th><label for="apppol-build-notes"><?php esc_html_e( 'What\'s new', 'app-policy-pages' ); ?></label></th>
+				<td><textarea id="apppol-build-notes" name="app_policy_build_notes" rows="3" class="large-text"></textarea></td></tr>
+		</table>
+
+		<h4><?php esc_html_e( 'Uploaded builds', 'app-policy-pages' ); ?></h4>
+		<?php if ( ! $builds ) : ?>
+			<p class="description"><?php esc_html_e( 'None yet.', 'app-policy-pages' ); ?></p>
+		<?php else : ?>
+			<table class="widefat striped">
+				<thead><tr><th><?php esc_html_e( 'Version', 'app-policy-pages' ); ?></th><th><?php esc_html_e( 'Uploaded', 'app-policy-pages' ); ?></th><th><?php esc_html_e( 'Size', 'app-policy-pages' ); ?></th><th><?php esc_html_e( 'What\'s new', 'app-policy-pages' ); ?></th><th><?php esc_html_e( 'Delete', 'app-policy-pages' ); ?></th></tr></thead>
+				<tbody>
+				<?php foreach ( $builds as $b ) : ?>
+					<tr>
+						<td><strong><?php echo esc_html( $b['version'] ); ?></strong><br><small><?php echo esc_html( $b['original'] ); ?></small></td>
+						<td><?php echo esc_html( wp_date( get_option( 'date_format' ) . ' ' . get_option( 'time_format' ), (int) $b['uploaded'] ) ); ?></td>
+						<td><?php echo esc_html( App_Policy_Pages::format_size( $b['size'] ) ); ?></td>
+						<td><?php echo nl2br( esc_html( $b['notes'] ) ); ?></td>
+						<td><input type="checkbox" name="app_policy_delete_builds[]" value="<?php echo esc_attr( $b['id'] ); ?>" aria-label="<?php esc_attr_e( 'Delete this build', 'app-policy-pages' ); ?>"></td>
+					</tr>
+				<?php endforeach; ?>
+				</tbody>
+			</table>
+			<p class="description"><?php esc_html_e( 'Ticked builds are deleted when you press Update.', 'app-policy-pages' ); ?></p>
+		<?php endif; ?>
+		<?php
 	}
 
 	public function status_changed( $new, $old, $post ) {
@@ -457,6 +703,7 @@ class App_Policy_Pages_Admin {
 		if ( ! $post || App_Policy_Pages::POST_TYPE !== $post->post_type || ! is_array( $raw ) ) {
 			wp_die( esc_html__( 'App not found.', 'app-policy-pages' ) );
 		}
+		unset( $raw['test']['key'] ); // Never put the private tester link in an export.
 		$export = array_merge(
 			array(
 				'format' => 'app-policy-pages/1',
@@ -515,6 +762,12 @@ class App_Policy_Pages_Admin {
 			echo '<div class="notice notice-success"><p>' . esc_html__( 'App imported as a draft. Check it over, then press Publish to make its pages live.', 'app-policy-pages' ) . '</p></div>';
 		}
 		// phpcs:enable
+		$nkey = 'app_policy_notice_' . get_current_user_id();
+		$note = get_transient( $nkey );
+		if ( is_array( $note ) ) {
+			delete_transient( $nkey );
+			echo '<div class="notice notice-' . esc_attr( 'error' === $note[0] ? 'error' : 'success' ) . ' is-dismissible"><p>' . esc_html( $note[1] ) . '</p></div>';
+		}
 		$key  = 'app_policy_conflict_' . get_current_user_id();
 		$slug = get_transient( $key );
 		if ( $slug ) {
@@ -529,6 +782,6 @@ class App_Policy_Pages_Admin {
 		if ( ! $screen || App_Policy_Pages::POST_TYPE !== $screen->post_type ) {
 			return;
 		}
-		echo '<style>.app-policy-form th{width:170px}.app-policy-linklist li{margin-bottom:.8em;word-break:break-all}.app-policy-placeholders li{margin-bottom:.3em}.app-policy-placeholders code{font-size:12px}</style>';
+		echo '<style>.app-policy-form th{width:170px}.app-policy-linklist li{margin-bottom:.8em;word-break:break-all}.app-policy-placeholders li{margin-bottom:.3em}.app-policy-placeholders code{font-size:12px}.app-policy-previews{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:8px}.app-policy-previews img{width:80px;height:80px;object-fit:cover;border-radius:8px;border:1px solid #dcdcde}</style>';
 	}
 }

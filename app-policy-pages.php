@@ -2,8 +2,8 @@
 /**
  * Plugin Name:       App Policy Pages
  * Plugin URI:        https://github.com/straconis/app-policy-pages
- * Description:       Hosts privacy policy, terms and data deletion pages for your mobile apps. Add an app, fill in its details, and each app gets its own URLs such as /your-app/privacy/.
- * Version:           1.0.0
+ * Description:       Hosts a landing page, privacy policy, terms, data deletion page and private test builds for each of your mobile apps, at URLs such as /your-app/ and /your-app/privacy/.
+ * Version:           1.1.0
  * Requires at least: 6.0
  * Requires PHP:      7.4
  * Author:            Straconis Software
@@ -16,7 +16,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'APP_POLICY_PAGES_VERSION', '1.0.0' );
+define( 'APP_POLICY_PAGES_VERSION', '1.1.0' );
 define( 'APP_POLICY_PAGES_FILE', __FILE__ );
 define( 'APP_POLICY_PAGES_DIR', plugin_dir_path( __FILE__ ) );
 

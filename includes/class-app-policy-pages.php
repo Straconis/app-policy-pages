@@ -18,6 +18,9 @@ class App_Policy_Pages {
 	const FLUSH_FLAG   = 'app_policy_pages_flush';
 	const QV_APP       = 'app_policy_app';
 	const QV_DOC       = 'app_policy_doc';
+	const QV_BUILD     = 'app_policy_build';
+	const BUILDS_META  = '_app_policy_builds';
+	const BUILDS_DIR   = 'app-policy-builds';
 
 	/** @var App_Policy_Pages|null */
 	private static $instance = null;
@@ -114,6 +117,8 @@ class App_Policy_Pages {
 				'effective_date' => '',
 				'last_updated'   => '',
 				'docs'           => array(),
+				'landing'        => array(),
+				'test'           => array(),
 			)
 		);
 
@@ -138,7 +143,131 @@ class App_Policy_Pages {
 				'content' => isset( $doc['content'] ) ? (string) $doc['content'] : '',
 			);
 		}
+		$landing        = is_array( $app['landing'] ) ? $app['landing'] : array();
+		$app['landing'] = array(
+			'enabled'        => ! empty( $landing['enabled'] ),
+			'tagline'        => isset( $landing['tagline'] ) ? (string) $landing['tagline'] : '',
+			'description'    => isset( $landing['description'] ) ? (string) $landing['description'] : '',
+			'icon_id'        => isset( $landing['icon_id'] ) ? absint( $landing['icon_id'] ) : 0,
+			'screenshot_ids' => isset( $landing['screenshot_ids'] ) ? array_values( array_filter( array_map( 'absint', (array) $landing['screenshot_ids'] ) ) ) : array(),
+		);
+		$test        = is_array( $app['test'] ) ? $app['test'] : array();
+		$app['test'] = array(
+			'enabled' => ! empty( $test['enabled'] ),
+			'key'     => isset( $test['key'] ) ? (string) $test['key'] : '',
+			'notes'   => isset( $test['notes'] ) ? (string) $test['notes'] : '',
+		);
 		return $app;
+	}
+
+	/* ------------------------------------------------------------------
+	 * Test builds
+	 * ------------------------------------------------------------------ */
+
+	/**
+	 * Builds for an app, newest first.
+	 */
+	public static function get_builds( $app_id ) {
+		$builds = get_post_meta( $app_id, self::BUILDS_META, true );
+		$builds = is_array( $builds ) ? array_values( $builds ) : array();
+		foreach ( $builds as $i => $build ) {
+			$builds[ $i ]['_order'] = $i; // Later in the list = uploaded later.
+		}
+		usort(
+			$builds,
+			function ( $a, $b ) {
+				$by_time = (int) $b['uploaded'] - (int) $a['uploaded'];
+				return 0 !== $by_time ? $by_time : $b['_order'] - $a['_order'];
+			}
+		);
+		return $builds;
+	}
+
+	/**
+	 * Private folder that holds the uploaded builds. Web access to it is
+	 * denied; files are only sent through serve_build().
+	 */
+	public static function builds_dir( $app_id = 0 ) {
+		$uploads = wp_upload_dir( null, false );
+		$dir     = trailingslashit( $uploads['basedir'] ) . self::BUILDS_DIR;
+		if ( ! is_dir( $dir ) ) {
+			wp_mkdir_p( $dir );
+		}
+		if ( ! file_exists( $dir . '/.htaccess' ) ) {
+			// Apache / LiteSpeed. Nginx needs its own rule (see README).
+			file_put_contents( $dir . '/.htaccess', "# App Policy Pages: test builds are only served through WordPress.\n<IfModule mod_authz_core.c>\n\tRequire all denied\n</IfModule>\n<IfModule !mod_authz_core.c>\n\tOrder deny,allow\n\tDeny from all\n</IfModule>\n" ); // phpcs:ignore WordPress.WP.AlternativeFunctions
+			file_put_contents( $dir . '/index.php', "<?php\n// Silence is golden.\n" ); // phpcs:ignore WordPress.WP.AlternativeFunctions
+		}
+		if ( $app_id ) {
+			$dir .= '/' . (int) $app_id;
+			if ( ! is_dir( $dir ) ) {
+				wp_mkdir_p( $dir );
+				file_put_contents( $dir . '/index.php', "<?php\n// Silence is golden.\n" ); // phpcs:ignore WordPress.WP.AlternativeFunctions
+			}
+		}
+		return $dir;
+	}
+
+	public static function test_url( $app, $build_id = '' ) {
+		$path = self::prefix() . $app['slug'] . '/test/';
+		if ( $build_id ) {
+			$path .= 'download/' . $build_id . '/';
+		}
+		return add_query_arg( 'key', rawurlencode( $app['test']['key'] ), home_url( user_trailingslashit( $path ) ) );
+	}
+
+	/**
+	 * Testers get in with the key; people who can edit the app always can.
+	 */
+	public static function can_see_tests( $app ) {
+		if ( ! $app['test']['enabled'] ) {
+			return false;
+		}
+		if ( current_user_can( 'edit_post', $app['id'] ) ) {
+			return true;
+		}
+		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- the key is the access check.
+		$given = isset( $_GET['key'] ) ? sanitize_text_field( wp_unslash( $_GET['key'] ) ) : '';
+		return '' !== $app['test']['key'] && '' !== $given && hash_equals( $app['test']['key'], $given );
+	}
+
+	private static function no_cache_private() {
+		if ( ! defined( 'DONOTCACHEPAGE' ) ) {
+			define( 'DONOTCACHEPAGE', true );
+		}
+		do_action( 'litespeed_control_set_nocache', 'app policy pages test builds' );
+		nocache_headers();
+		header( 'X-Robots-Tag: noindex, nofollow', true );
+		header( 'Referrer-Policy: no-referrer', true );
+	}
+
+	private static function serve_build( $app, $build_id ) {
+		foreach ( self::get_builds( $app['id'] ) as $build ) {
+			if ( $build['id'] !== $build_id ) {
+				continue;
+			}
+			$file = self::builds_dir( $app['id'] ) . '/' . basename( $build['file'] );
+			if ( ! is_readable( $file ) ) {
+				break;
+			}
+			$name = sanitize_file_name( $app['slug'] . '-' . $build['version'] . '.apk' );
+			while ( ob_get_level() ) {
+				ob_end_clean();
+			}
+			self::no_cache_private();
+			status_header( 200 );
+			header( 'Content-Type: application/vnd.android.package-archive' );
+			header( 'Content-Disposition: attachment; filename="' . $name . '"' );
+			header( 'Content-Length: ' . filesize( $file ) );
+			header( 'X-Content-Type-Options: nosniff' );
+			readfile( $file ); // phpcs:ignore WordPress.WP.AlternativeFunctions
+			exit;
+		}
+		return false;
+	}
+
+	public static function format_size( $bytes ) {
+		return size_format( (int) $bytes, 1 );
 	}
 
 	/**
@@ -183,6 +312,39 @@ class App_Policy_Pages {
 			'{terms_url}'      => __( "This app's terms URL", 'app-policy-pages' ),
 			'{deletion_url}'   => __( "This app's data deletion URL", 'app-policy-pages' ),
 		);
+	}
+
+	/**
+	 * Shared CSS for the stand-alone pages.
+	 */
+	public static function base_css( $accent ) {
+		return ':root{--bg:#faf8fc;--fg:#2a1a14;--muted:#6b5c66;--accent:' . esc_html( $accent ) . ';--rule:#e4dde8;--card:#ffffff}'
+			. '@media (prefers-color-scheme:dark){:root{--bg:#1b1720;--fg:#f1ecf4;--muted:#b4a9bb;--rule:#3a3240;--card:#25202b}a{filter:brightness(1.35)}}'
+			. 'body{background:var(--bg);color:var(--fg);font:17px/1.6 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;margin:0;padding:32px 16px 64px}'
+			. 'main{max-width:680px;margin:0 auto}h1{font-size:1.8rem;line-height:1.2;margin:0 0 4px}h2{font-size:1.15rem;margin:2rem 0 .4rem}h3{font-size:1rem;margin:1.5rem 0 .3rem}'
+			. '.date{color:var(--muted);margin-top:0}a{color:var(--accent)}ul{padding-left:1.3em}img{max-width:100%;height:auto}'
+			. 'footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--rule);color:var(--muted);font-size:.9rem}footer a{color:inherit}'
+			. '.doc-list{list-style:none;padding:0}.doc-list li{margin:.6rem 0;font-size:1.1rem}'
+			. '.button{display:inline-block;background:var(--accent);color:#fff;text-decoration:none;font-weight:600;padding:.6em 1.2em;border-radius:999px}'
+			. '@media (prefers-color-scheme:dark){.button{filter:none;color:#111}}';
+	}
+
+	/**
+	 * Footer links shared by every stand-alone page.
+	 */
+	public static function footer_links( $app, $current = '' ) {
+		$parts = array();
+		foreach ( self::document_types() as $key => $type ) {
+			if ( $key !== $current && $app['docs'][ $key ]['enabled'] ) {
+				$parts[] = '<a href="' . esc_url( self::app_url( $app, $key ) ) . '">' . esc_html( $type['label'] ) . '</a>';
+			}
+		}
+		if ( $app['website'] ) {
+			$parts[] = '<a href="' . esc_url( $app['website'] ) . '">' . esc_html( $app['developer'] ) . '</a>';
+		} else {
+			$parts[] = esc_html( $app['developer'] );
+		}
+		return implode( ' · ', $parts );
 	}
 
 	public static function format_date( $ymd ) {
@@ -261,6 +423,7 @@ class App_Policy_Pages {
 	public function query_vars( $vars ) {
 		$vars[] = self::QV_APP;
 		$vars[] = self::QV_DOC;
+		$vars[] = self::QV_BUILD;
 		return $vars;
 	}
 
@@ -283,6 +446,8 @@ class App_Policy_Pages {
 			foreach ( $paths as $path => $key ) {
 				add_rewrite_rule( '^' . $prefix . $s . '/' . preg_quote( $path, '#' ) . '/?$', 'index.php?' . self::QV_APP . '=' . rawurlencode( $slug ) . '&' . self::QV_DOC . '=' . $key, 'top' );
 			}
+			add_rewrite_rule( '^' . $prefix . $s . '/test/download/([a-z0-9]+)/?$', 'index.php?' . self::QV_APP . '=' . rawurlencode( $slug ) . '&' . self::QV_DOC . '=test&' . self::QV_BUILD . '=$matches[1]', 'top' );
+			add_rewrite_rule( '^' . $prefix . $s . '/test/?$', 'index.php?' . self::QV_APP . '=' . rawurlencode( $slug ) . '&' . self::QV_DOC . '=test', 'top' );
 			add_rewrite_rule( '^' . $prefix . $s . '/?$', 'index.php?' . self::QV_APP . '=' . rawurlencode( $slug ), 'top' );
 		}
 	}
@@ -314,6 +479,11 @@ class App_Policy_Pages {
 	}
 
 	public function maybe_flush() {
+		// New versions may add URLs, so rebuild the rules once after an update.
+		if ( get_option( 'app_policy_pages_version' ) !== APP_POLICY_PAGES_VERSION ) {
+			update_option( 'app_policy_pages_version', APP_POLICY_PAGES_VERSION, true );
+			self::rebuild_routes();
+		}
 		if ( get_option( self::FLUSH_FLAG ) ) {
 			delete_option( self::FLUSH_FLAG );
 			flush_rewrite_rules( false );
@@ -339,23 +509,46 @@ class App_Policy_Pages {
 		$doc_key = (string) get_query_var( self::QV_DOC );
 		$types   = self::document_types();
 
-		if ( ! $app || ( '' !== $doc_key && ( ! isset( $types[ $doc_key ] ) || ! $app['docs'][ $doc_key ]['enabled'] ) ) ) {
+		$is_test = 'test' === $doc_key;
+		if ( $app && $is_test && ! self::can_see_tests( $app ) ) {
+			$app = null; // A wrong key looks the same as no page at all.
+		}
+		if ( ! $app || ( '' !== $doc_key && ! $is_test && ( ! isset( $types[ $doc_key ] ) || ! $app['docs'][ $doc_key ]['enabled'] ) ) ) {
 			global $wp_query;
 			$wp_query->set_404();
 			status_header( 404 );
+			if ( $is_test ) {
+				self::no_cache_private();
+			}
 			return; // Let the theme show its normal 404 page.
 		}
 
-		status_header( 200 );
-		nocache_headers();
 		$settings = self::settings();
-		$template = APP_POLICY_PAGES_DIR . 'templates/page.php';
+		if ( $is_test ) {
+			$build_id = sanitize_key( (string) get_query_var( self::QV_BUILD ) );
+			if ( $build_id ) {
+				self::serve_build( $app, $build_id );
+				global $wp_query;
+				$wp_query->set_404();
+				status_header( 404 );
+				return;
+			}
+			self::no_cache_private();
+			$template = APP_POLICY_PAGES_DIR . 'templates/test-builds.php';
+		} elseif ( '' === $doc_key && $app['landing']['enabled'] ) {
+			nocache_headers();
+			$template = APP_POLICY_PAGES_DIR . 'templates/landing.php';
+		} else {
+			nocache_headers();
+			$template = APP_POLICY_PAGES_DIR . 'templates/page.php';
+		}
+		status_header( 200 );
 		/**
 		 * Filter the template file used for a policy page.
 		 *
 		 * @param string $template Absolute path.
 		 * @param array  $app      App data.
-		 * @param string $doc_key  Document key, or '' for the app's index page.
+		 * @param string $doc_key  Document key, 'test' for test builds, or '' for the app's index or landing page.
 		 */
 		$template = apply_filters( 'app_policy_pages_template', $template, $app, $doc_key );
 		include $template;
